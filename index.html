@@ -252,7 +252,7 @@
         ctx.fillText(text, canvas.width / 2, canvas.height / 2);
       }
 
-      let animationFrameId;
+      let updateIntervalId;
       function updateLoop() {
         const now = getCorrectedDate();
         const timeString = formatTime(now);
@@ -262,8 +262,14 @@
 
         // Update Canvas (for PiP)
         drawToCanvas(timeString);
+      }
 
-        requestAnimationFrame(updateLoop);
+      // Use setInterval instead of requestAnimationFrame
+      // requestAnimationFrame pauses when tab is hidden/backgrounded
+      // setInterval continues to run (may be throttled but still works)
+      function startUpdateLoop() {
+        updateLoop(); // Initial call
+        updateIntervalId = setInterval(updateLoop, 100); // Update every 100ms
       }
 
       // 3. PiP Logic
@@ -359,7 +365,7 @@
 
       // Initial sync and start loop
       syncTime();
-      updateLoop();
+      startUpdateLoop();
 
       // Re-sync every 10 minutes to prevent drift if tabs are suspended
       setInterval(syncTime, 10 * 60 * 1000);
