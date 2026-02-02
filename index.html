@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KTimer PiP</title>
+    <style>
+      :root {
+        --bg-color: #0f172a;
+        --text-color: #f8fafc;
+        --accent-color: #38bdf8;
+        --font-family: "Inter", system-ui, -apple-system, sans-serif;
+      }
+
+      body {
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        background-color: var(--bg-color);
+        color: var(--text-color);
+        font-family: var(--font-family);
+        overflow: hidden;
+        text-align: center;
+      }
+
+      h1 {
+        font-size: 2rem;
+        margin-bottom: 2rem;
+        font-weight: 300;
+        opacity: 0.9;
+      }
+
+      #clock-display {
+        font-size: 5rem;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -2px;
+        margin-bottom: 3rem;
+        text-shadow: 0 0 20px rgba(56, 189, 248, 0.3);
+      }
+
+      .btn {
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        padding: 1rem 2rem;
+        border-radius: 999px;
+        color: white;
+        font-size: 1.1rem;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        -webkit-backdrop-filter: blur(10px);
+        backdrop-filter: blur(10px);
+        font-family: inherit;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      .btn:hover {
+        background: rgba(255, 255, 255, 0.2);
+        transform: translateY(-2px);
+      }
+
+      .btn:active {
+        transform: translateY(0);
+      }
+
+      /* Hidden elements for PiP */
+      #pip-canvas {
+        position: absolute;
+        top: -9999px;
+        left: -9999px;
+        pointer-events: none;
+      }
+
+      #pip-video {
+        position: absolute;
+        width: 0;
+        height: 0;
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      .status {
+        margin-top: 1rem;
+        font-size: 0.9rem;
+        color: #94a3b8;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>KTimer</h1>
+    <div id="clock-display">Loading...</div>
+    <button id="pip-btn" class="btn">
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width="24"
+        height="24"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path
+          d="M21 16.5a2.5 2.5 0 0 0 .5-2V5.5c0-.8-.7-1.5-1.5-1.5h-16C3.2 4 2.5 4.7 2.5 5.5v9c0 .8.7 1.5 1.5 1.5H8"
+        />
+        <path d="M8 19.5v.5h11c.8 0 1.5-.7 1.5-1.5v-2" />
+        <path d="M12 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z" />
+        <path d="M12 21.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z" />
+      </svg>
+      Open Mini Player
+    </button>
+    <div id="status-text" class="status">Syncing time...</div>
+
+    <!-- Hidden canvas to render the clock image for PiP. Increased res for DPI. -->
+    <!-- Changed height to 750 (21:9 ultrawide aspect) to balance top/bottom padding with sides -->
+    <canvas id="pip-canvas" width="1920" height="750"></canvas>
+
+    <!-- Video element to stream the canvas, needed for PiP API -->
+    <!-- Removed 'muted' to try and hide the mute icon. -->
+    <video id="pip-video" autoplay playsinline></video>
+
+    <script>
+      const clockDisplay = document.getElementById("clock-display");
+      const pipBtn = document.getElementById("pip-btn");
+      const statusText = document.getElementById("status-text");
+      const canvas = document.getElementById("pip-canvas");
+      const ctx = canvas.getContext("2d");
+      const video = document.getElementById("pip-video");
+
+      let timeOffset = -1000; // Difference between server time and local time in ms
+      let isSyncing = true;
+
+      // 1. Time Synchronization
+      // We perform a "burst" of requests and pick the one with the lowest latency (RTT)
+      // This is standard NTP practice to avoid network jitter causing time errors.
+      async function fetchTimeSample() {
+        const start = Date.now();
+        try {
+          const response = await fetch(
+            "https://timeapi.io/api/Time/current/zone?timeZone=UTC",
+            { cache: "no-store" },
+          );
+          if (!response.ok) throw new Error(response.status);
+          const data = await response.json();
+          const end = Date.now();
+
+          const latency = (end - start) / 2;
+          const serverTime = new Date(data.dateTime + "Z").getTime();
+          const offset = serverTime + latency - end; // offset relative to 'end' time
+
+          return { offset, rtt: end - start, error: null };
+        } catch (e) {
+          return { error: e };
+        }
+      }
+
+      async function syncTime() {
+        statusText.textContent = "Precision syncing...";
+
+        // Take 3 samples
+        const samples = [];
+        for (let i = 0; i < 3; i++) {
+          statusText.textContent = `Syncing sample ${i + 1}/3...`;
+          const sample = await fetchTimeSample();
+          if (!sample.error) {
+            samples.push(sample);
+          }
+          // Small delay between samples
+          await new Promise((r) => setTimeout(r, 200));
+        }
+
+        if (samples.length === 0) {
+          console.error("All sync samples failed");
+          statusText.textContent = "Sync failed, using device time.";
+          isSyncing = false;
+          setTimeout(syncTime, 10000); // Retry logic
+          return;
+        }
+
+        // Pick sample with lowest RTT (Round Trip Time) -> Most accurate
+        samples.sort((a, b) => a.rtt - b.rtt);
+        const bestSample = samples[0];
+
+        // Apply
+        timeOffset = bestSample.offset;
+        isSyncing = false;
+
+        const rttMsg = `RTT: ${bestSample.rtt}ms`;
+        statusText.textContent = `Synced! (${rttMsg})`;
+        setTimeout(() => (statusText.textContent = ""), 3000);
+      }
+
+      // 2. Clock Logic
+      function getCorrectedDate() {
+        // Adjust local time by the calculated offset
+        const now = Date.now() + timeOffset + userOffset;
+        return new Date(now);
+      }
+
+      function formatTime(date) {
+        // Force 2 digits for hours, minutes, seconds
+        const pad = (n) => n.toString().padStart(2, "0");
+        const h = pad(date.getHours());
+        const m = pad(date.getMinutes());
+        const s = pad(date.getSeconds());
+        return `${h}:${m}:${s}`;
+      }
+
+      function drawToCanvas(text) {
+        // Clear background
+        ctx.fillStyle = "#0f172a"; // Match body bg
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // Draw text
+        ctx.fillStyle = "#f8fafc";
+        ctx.font = 'bold 450px "Inter", sans-serif'; // Optimized for 750px height
+        ctx.textBaseline = "middle";
+        ctx.textAlign = "center";
+        ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+      }
+
+      let animationFrameId;
+      function updateLoop() {
+        const now = getCorrectedDate();
+        const timeString = formatTime(now);
+
+        // Update DOM
+        clockDisplay.textContent = timeString;
+
+        // Update Canvas (for PiP)
+        drawToCanvas(timeString);
+
+        requestAnimationFrame(updateLoop);
+      }
+
+      // 3. PiP Logic
+      async function startPip() {
+        if (document.pictureInPictureElement) {
+          await document.exitPictureInPicture();
+          return;
+        }
+
+        try {
+          // Ensure the video is playing a stream from the canvas
+          if (!video.srcObject) {
+            const stream = canvas.captureStream(30); // 30 FPS
+            video.srcObject = stream;
+          }
+
+          // Ensure valid volume state (unmuted) so icon doesn't show "muted"
+          video.muted = false;
+          video.volume = 1.0;
+
+          // Play logic for iOS/Android compatibility
+          await video.play();
+
+          // Set Media Session metadata to look like a Clock app, not a video
+          if ("mediaSession" in navigator) {
+            navigator.mediaSession.metadata = new MediaMetadata({
+              title: "Đồng hồ KTimer",
+              artist: "Hệ thống",
+              album: "Picture-in-Picture",
+            });
+            navigator.mediaSession.playbackState = "playing";
+          }
+
+          // Request PiP
+          await video.requestPictureInPicture();
+        } catch (err) {
+          console.error("PiP Error:", err);
+          statusText.textContent = `Error: ${err.message}`;
+        }
+      }
+
+      // Initialize
+      pipBtn.innerHTML = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><path d="M7 7h10 M7 12h10 M7 17h10"/></svg>
+      Bật Đồng Hồ PiP`; // Updated Text and Icon (Layout)
+      pipBtn.addEventListener("click", startPip);
+
+      // Manual Offset Logic
+      let userOffset = -1000;
+      const offsetControls = document.createElement("div");
+      offsetControls.style.marginTop = "2rem";
+      offsetControls.innerHTML = `
+        <div style="font-size: 0.9rem; color: #94a3b8; margin-bottom: 0.5rem;">Căn chỉnh thời gian (ms)</div>
+        <div style="display: flex; gap: 0.5rem; justify-content: center; align-items: center;">
+            <button class="btn-micro" onclick="adjustOffset(-1000)">-1s</button>
+            <button class="btn-micro" onclick="adjustOffset(-100)">-0.1s</button>
+            <span id="offset-display" style="min-width: 60px; font-variant-numeric: tabular-nums;">-1000ms</span>
+            <button class="btn-micro" onclick="adjustOffset(100)">+0.1s</button>
+            <button class="btn-micro" onclick="adjustOffset(1000)">+1s</button>
+        </div>
+      `;
+      document.body.appendChild(offsetControls);
+
+      // Add styles for micro buttons
+      const style = document.createElement("style");
+      style.textContent = `
+        .btn-micro {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #ccc;
+            padding: 0.5rem 0.8rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: inherit;
+        }
+        .btn-micro:hover { background: rgba(255, 255, 255, 0.1); }
+      `;
+      document.head.appendChild(style);
+
+      window.adjustOffset = (amount) => {
+        userOffset += amount;
+        document.getElementById("offset-display").textContent =
+          (userOffset > 0 ? "+" : "") + userOffset + "ms";
+      };
+
+      // Update getCorrectedDate to include userOffset
+      const originalGetCorrectedDate = getCorrectedDate;
+      getCorrectedDate = function () {
+        // Base time (Server Sync) + User Manual Offset
+        const now = Date.now() + timeOffset + userOffset;
+        return new Date(now);
+      };
+
+      // Initial sync and start loop
+      syncTime();
+      updateLoop();
+
+      // Re-sync every 10 minutes to prevent drift if tabs are suspended
+      setInterval(syncTime, 10 * 60 * 1000);
+    </script>
+  </body>
+</html>
