@@ -160,40 +160,89 @@
       const ctx = canvas.getContext("2d");
       const video = document.getElementById("pip-video");
 
-      let timeOffset = -1000; // Difference between server time and local time in ms
+      let timeOffset = 0; // Difference between server time and local time in ms
       let isSyncing = true;
+      let syncInProgress = false;
+      let canvasStreamTrack = null;
+      const AUTO_RESYNC_INTERVAL_MS = 60 * 1000;
+      const FORCE_RESYNC_DRIFT_MS = 1000;
+      const MAX_TRUSTED_OFFSET_MS = 2 * 60 * 1000;
+      const DISPLAY_LEAD_MS = 500;
 
       // 1. Time Synchronization
       // We perform a "burst" of requests and pick the one with the lowest latency (RTT)
       // This is standard NTP practice to avoid network jitter causing time errors.
-      async function fetchTimeSample() {
-        const start = Date.now();
+      async function fetchJsonWithTimeout(url, timeoutMs = 5000) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
         try {
-          const response = await fetch(
-            "https://timeapi.io/api/Time/current/zone?timeZone=UTC",
-            { cache: "no-store" },
-          );
-          if (!response.ok) throw new Error(response.status);
-          const data = await response.json();
-          const end = Date.now();
-
-          const latency = (end - start) / 2;
-          const serverTime = new Date(data.dateTime + "Z").getTime();
-          const offset = serverTime + latency - end; // offset relative to 'end' time
-
-          return { offset, rtt: end - start, error: null };
-        } catch (e) {
-          return { error: e };
+          const response = await fetch(url, {
+            cache: "no-store",
+            signal: controller.signal,
+          });
+          if (!response.ok)
+            throw new Error(`${url} returned ${response.status}`);
+          return await response.json();
+        } finally {
+          clearTimeout(timeoutId);
         }
       }
 
-      async function syncTime() {
-        statusText.textContent = "Precision syncing...";
+      async function fetchTimeSample() {
+        const sources = [
+          {
+            name: "worldtimeapi.org",
+            url: "https://worldtimeapi.org/api/timezone/Etc/UTC",
+            getServerTime: (data) =>
+              new Date(data.utc_datetime || data.datetime).getTime(),
+          },
+        ];
+
+        let lastError = null;
+        for (const source of sources) {
+          const start = Date.now();
+          try {
+            const data = await fetchJsonWithTimeout(source.url);
+            const end = Date.now();
+            const latency = (end - start) / 2;
+            const serverTime = source.getServerTime(data);
+
+            if (!Number.isFinite(serverTime)) {
+              throw new Error(`${source.name} returned an invalid time`);
+            }
+
+            const offset = serverTime + latency - end; // offset relative to 'end' time
+            if (Math.abs(offset) > MAX_TRUSTED_OFFSET_MS) {
+              throw new Error(
+                `${source.name} offset rejected: ${Math.round(offset)}ms`,
+              );
+            }
+            return {
+              offset,
+              rtt: end - start,
+              source: source.name,
+              error: null,
+            };
+          } catch (e) {
+            lastError = e;
+            console.warn(`Time source failed: ${source.name}`, e);
+          }
+        }
+
+        return { error: lastError || new Error("All time sources failed") };
+      }
+
+      async function syncTime({ silent = false } = {}) {
+        if (syncInProgress) return;
+
+        syncInProgress = true;
+        if (!silent) statusText.textContent = "Precision syncing...";
 
         // Take 3 samples
         const samples = [];
         for (let i = 0; i < 3; i++) {
-          statusText.textContent = `Syncing sample ${i + 1}/3...`;
+          if (!silent) statusText.textContent = `Syncing sample ${i + 1}/3...`;
           const sample = await fetchTimeSample();
           if (!sample.error) {
             samples.push(sample);
@@ -204,9 +253,13 @@
 
         if (samples.length === 0) {
           console.error("All sync samples failed");
-          statusText.textContent = "Sync failed, using device time.";
+          if (!silent) {
+            statusText.textContent = "Using device time.";
+            setTimeout(() => (statusText.textContent = ""), 3000);
+          }
           isSyncing = false;
-          setTimeout(syncTime, 10000); // Retry logic
+          syncInProgress = false;
+          setTimeout(() => syncTime({ silent: true }), 10000); // Retry logic
           return;
         }
 
@@ -214,22 +267,24 @@
         samples.sort((a, b) => a.rtt - b.rtt);
         const bestSample = samples[0];
 
-        // Apply
+        const drift = bestSample.offset - timeOffset;
+        const shouldShowStatus =
+          !silent || Math.abs(drift) >= FORCE_RESYNC_DRIFT_MS;
+
         timeOffset = bestSample.offset;
         isSyncing = false;
+        syncInProgress = false;
 
         const rttMsg = `RTT: ${bestSample.rtt}ms`;
-        statusText.textContent = `Synced! (${rttMsg})`;
-        setTimeout(() => (statusText.textContent = ""), 3000);
+        const driftMsg = `drift: ${Math.round(drift)}ms`;
+        const sourceMsg = `source: ${bestSample.source}`;
+        if (shouldShowStatus) {
+          statusText.textContent = `Re-synced! (${rttMsg}, ${driftMsg}, ${sourceMsg})`;
+          setTimeout(() => (statusText.textContent = ""), 3000);
+        }
       }
 
       // 2. Clock Logic
-      function getCorrectedDate() {
-        // Adjust local time by the calculated offset
-        const now = Date.now() + timeOffset + userOffset;
-        return new Date(now);
-      }
-
       function formatTime(date) {
         // Force 2 digits for hours, minutes, seconds
         const pad = (n) => n.toString().padStart(2, "0");
@@ -250,9 +305,12 @@
         ctx.textBaseline = "middle";
         ctx.textAlign = "center";
         ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+        // Force a fresh frame for PiP, especially when the tab is backgrounded/throttled.
+        canvasStreamTrack?.requestFrame?.();
       }
 
-      let updateIntervalId;
+      let updateTimeoutId;
       function updateLoop() {
         const now = getCorrectedDate();
         const timeString = formatTime(now);
@@ -262,14 +320,15 @@
 
         // Update Canvas (for PiP)
         drawToCanvas(timeString);
+
+        // Schedule the next render just after the next second boundary.
+        const delayUntilNextSecond = 1000 - now.getMilliseconds() + 20;
+        updateTimeoutId = setTimeout(updateLoop, delayUntilNextSecond);
       }
 
-      // Use setInterval instead of requestAnimationFrame
-      // requestAnimationFrame pauses when tab is hidden/backgrounded
-      // setInterval continues to run (may be throttled but still works)
       function startUpdateLoop() {
+        clearTimeout(updateTimeoutId);
         updateLoop(); // Initial call
-        updateIntervalId = setInterval(updateLoop, 100); // Update every 100ms
       }
 
       // 3. PiP Logic
@@ -282,7 +341,8 @@
         try {
           // Ensure the video is playing a stream from the canvas
           if (!video.srcObject) {
-            const stream = canvas.captureStream(30); // 30 FPS
+            const stream = canvas.captureStream(0); // Manual frames via requestFrame()
+            canvasStreamTrack = stream.getVideoTracks()[0] || null;
             video.srcObject = stream;
           }
 
@@ -318,7 +378,7 @@
       pipBtn.addEventListener("click", startPip);
 
       // Manual Offset Logic
-      let userOffset = -1000;
+      let userOffset = 0;
       const offsetControls = document.createElement("div");
       offsetControls.style.marginTop = "2rem";
       offsetControls.innerHTML = `
@@ -326,7 +386,7 @@
         <div style="display: flex; gap: 0.5rem; justify-content: center; align-items: center;">
             <button class="btn-micro" onclick="adjustOffset(-1000)">-1s</button>
             <button class="btn-micro" onclick="adjustOffset(-100)">-0.1s</button>
-            <span id="offset-display" style="min-width: 60px; font-variant-numeric: tabular-nums;">-1000ms</span>
+            <span id="offset-display" style="min-width: 60px; font-variant-numeric: tabular-nums;">0ms</span>
             <button class="btn-micro" onclick="adjustOffset(100)">+0.1s</button>
             <button class="btn-micro" onclick="adjustOffset(1000)">+1s</button>
         </div>
@@ -355,20 +415,18 @@
           (userOffset > 0 ? "+" : "") + userOffset + "ms";
       };
 
-      // Update getCorrectedDate to include userOffset
-      const originalGetCorrectedDate = getCorrectedDate;
-      getCorrectedDate = function () {
+      function getCorrectedDate() {
         // Base time (Server Sync) + User Manual Offset
-        const now = Date.now() + timeOffset + userOffset;
+        const now = Date.now() + timeOffset + userOffset + DISPLAY_LEAD_MS;
         return new Date(now);
-      };
+      }
 
       // Initial sync and start loop
       syncTime();
       startUpdateLoop();
 
-      // Re-sync every 10 minutes to prevent drift if tabs are suspended
-      setInterval(syncTime, 10 * 60 * 1000);
+      // Auto re-sync every minute. If drift is >= 1s, the new offset is applied immediately.
+      setInterval(() => syncTime({ silent: true }), AUTO_RESYNC_INTERVAL_MS);
     </script>
   </body>
 </html>
