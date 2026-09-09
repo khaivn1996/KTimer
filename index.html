@@ -137,7 +137,10 @@
     </h1>
 
     <!-- Time.is owns the displayed time. -->
-    <span id="_z418" aria-live="off">Loading...</span>
+    <!-- Hidden Time.is-owned output. We keep this element for the official widget,
+         then mirror its callback to the visible clock with a tiny paint-phase delay. -->
+    <span id="_z418" aria-live="off" style="position:absolute;left:-9999px;top:-9999px;visibility:hidden">Loading...</span>
+    <div id="clock-display" aria-live="off">--:--:--</div>
 
     <!-- Required visible attribution/back-link for the Time.is widget. -->
     <a
@@ -161,7 +164,8 @@
     <video id="pip-video" autoplay playsinline></video>
 
     <script>
-      const clockDisplay = document.getElementById("_z418");
+      const timeIsSource = document.getElementById("_z418");
+      const clockDisplay = document.getElementById("clock-display");
       const pipBtn = document.getElementById("pip-btn");
       const statusText = document.getElementById("status-text");
       const canvas = document.getElementById("pip-canvas");
@@ -170,21 +174,40 @@
 
       let canvasStreamTrack = null;
       let lastTimeIsValue = "";
+      let displayDelayTimer = null;
 
-      // Match the original KTimer clock styling while letting Time.is write into this element.
-      clockDisplay.id = "_z418";
-      clockDisplay.style.fontSize = "5rem";
-      clockDisplay.style.fontWeight = "700";
-      clockDisplay.style.fontVariantNumeric = "tabular-nums";
-      clockDisplay.style.letterSpacing = "-2px";
-      clockDisplay.style.marginBottom = "1rem";
-      clockDisplay.style.textShadow = "0 0 20px rgba(56, 189, 248, 0.3)";
-      clockDisplay.style.display = "block";
+      // Time.is and time.is itself can cross the second boundary on different browser
+      // paint frames. A small intentional delay avoids KTimer visibly flipping early.
+      // If needed, tune this between ~20 and 100 ms on your own machine/network.
+      const DISPLAY_ALIGNMENT_DELAY_MS = 50;
 
-      function normalizeTimeIsValue(value) {
+      function extractTimeIsClock(value) {
+        // Time.is may pass the rendered template URL-encoded (for example "%3Cspan...").
+        // Decode it first, then strip any HTML and keep only HH:MM:SS.
+        let decoded = String(value ?? "");
+
+        // Decode at most twice so both single- and double-encoded payloads are handled,
+        // without getting stuck on malformed percent sequences.
+        for (let i = 0; i < 2; i++) {
+          try {
+            const next = decodeURIComponent(decoded);
+            if (next === decoded) break;
+            decoded = next;
+          } catch {
+            break;
+          }
+        }
+
         const holder = document.createElement("div");
-        holder.innerHTML = String(value ?? "");
-        return holder.textContent.trim();
+        holder.innerHTML = decoded;
+        const plainText = (holder.textContent || holder.innerText || "")
+          .replace(/\u00a0/g, " ")
+          .trim();
+
+        // Only accept a valid 24-hour clock value. This prevents encoded HTML,
+        // URLs, titles, etc. from ever being shown in the KTimer display/PiP.
+        const match = plainText.match(/(?:^|\D)((?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d)(?:\D|$)/);
+        return match ? match[1] : "";
       }
 
       function drawToCanvas(text) {
@@ -203,11 +226,18 @@
       // Official Time.is advanced-widget callback.
       // The value received here is the same rendered TIME string used by the widget.
       window.ktimerTimeIsTick = function (renderedValue) {
-        const timeText = normalizeTimeIsValue(renderedValue);
+        const timeText = extractTimeIsClock(renderedValue);
         if (!timeText) return;
 
-        lastTimeIsValue = timeText;
-        drawToCanvas(timeText);
+        clearTimeout(displayDelayTimer);
+        displayDelayTimer = setTimeout(() => {
+          // Paint on the next frame after the alignment delay so DOM and PiP switch together.
+          requestAnimationFrame(() => {
+            lastTimeIsValue = timeText;
+            clockDisplay.textContent = timeText;
+            drawToCanvas(timeText);
+          });
+        }, DISPLAY_ALIGNMENT_DELAY_MS);
 
         if (statusText.textContent) {
           statusText.textContent = "Nguồn thời gian: Time.is · Vĩnh Long";
@@ -230,7 +260,7 @@
             throw new Error("Trình duyệt này không hỗ trợ Picture-in-Picture API cho video.");
           }
 
-          drawToCanvas(lastTimeIsValue || clockDisplay.textContent.trim());
+          drawToCanvas(lastTimeIsValue || clockDisplay.textContent.trim() || "--:--:--");
 
           if (!video.srcObject) {
             const stream = canvas.captureStream(0);
@@ -268,6 +298,8 @@
       time_is_widget.init({
         _z418: {
           id: "Vĩnh_Long__Vinh_Long_z418",
+          template: "TIME",
+          time_format: "hours:minutes:seconds",
           callback: "ktimerTimeIsTick",
         },
       });
