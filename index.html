@@ -1,18 +1,20 @@
 <!doctype html>
-<html lang="en">
+<html lang="vi">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>KTimer PiP</title>
-    <!-- Using user-provided 'timer.png' as favicon -->
+    <title>KTimer PiP - Time.is</title>
     <link rel="icon" href="timer.png" type="image/png" />
     <style>
       :root {
         --bg-color: #0f172a;
         --text-color: #f8fafc;
         --accent-color: #38bdf8;
-        --font-family: "Inter", system-ui, -apple-system, sans-serif;
+        --muted-color: #94a3b8;
+        --font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
+
+      * { box-sizing: border-box; }
 
       body {
         margin: 0;
@@ -31,7 +33,7 @@
 
       h1 {
         font-size: 2rem;
-        margin-bottom: 2rem;
+        margin: 0 0 2rem;
         font-weight: 300;
         opacity: 0.9;
         display: flex;
@@ -50,8 +52,22 @@
         font-weight: 700;
         font-variant-numeric: tabular-nums;
         letter-spacing: -2px;
-        margin-bottom: 3rem;
+        margin-bottom: 1rem;
         text-shadow: 0 0 20px rgba(56, 189, 248, 0.3);
+        min-width: 8ch;
+      }
+
+      #time_is_link {
+        display: inline-block;
+        margin-bottom: 2rem;
+        color: var(--muted-color);
+        font-size: 0.95rem;
+        text-decoration: none;
+      }
+
+      #time_is_link:hover {
+        color: var(--text-color);
+        text-decoration: underline;
       }
 
       .btn {
@@ -76,11 +92,8 @@
         transform: translateY(-2px);
       }
 
-      .btn:active {
-        transform: translateY(0);
-      }
+      .btn:active { transform: translateY(0); }
 
-      /* Hidden elements for PiP */
       #pip-canvas {
         position: absolute;
         top: -9999px;
@@ -97,12 +110,14 @@
       }
 
       .status {
+        min-height: 1.2em;
         margin-top: 1rem;
         font-size: 0.9rem;
-        color: #94a3b8;
+        color: var(--muted-color);
       }
     </style>
   </head>
+
   <body>
     <h1>
       <svg
@@ -120,218 +135,90 @@
       </svg>
       KTimer
     </h1>
-    <div id="clock-display">Loading...</div>
+
+    <!-- Time.is owns the displayed time. -->
+    <span id="_z418" aria-live="off">Loading...</span>
+
+    <!-- Required visible attribution/back-link for the Time.is widget. -->
+    <a
+      href="https://time.is/V%C4%A9nh_Long,_Vinh_Long"
+      id="time_is_link"
+      rel="nofollow"
+      target="_blank"
+    >Thời gian ở Vĩnh Long · Time.is</a>
+
     <button id="pip-btn" class="btn">
-      <svg
-        xmlns="http://www.w3.org/2000/svg"
-        width="24"
-        height="24"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-      >
-        <path
-          d="M21 16.5a2.5 2.5 0 0 0 .5-2V5.5c0-.8-.7-1.5-1.5-1.5h-16C3.2 4 2.5 4.7 2.5 5.5v9c0 .8.7 1.5 1.5 1.5H8"
-        />
-        <path d="M8 19.5v.5h11c.8 0 1.5-.7 1.5-1.5v-2" />
-        <path d="M12 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z" />
-        <path d="M12 21.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z" />
+      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
+        <path d="M7 7h10 M7 12h10 M7 17h10" />
       </svg>
-      Open Mini Player
+      Bật Đồng Hồ PiP
     </button>
-    <div id="status-text" class="status">Syncing time...</div>
 
-    <!-- Hidden canvas to render the clock image for PiP. Increased res for DPI. -->
-    <!-- Changed height to 750 (21:9 ultrawide aspect) to balance top/bottom padding with sides -->
+    <div id="status-text" class="status">Đang lấy giờ trực tiếp từ Time.is...</div>
+
     <canvas id="pip-canvas" width="1920" height="750"></canvas>
-
-    <!-- Video element to stream the canvas, needed for PiP API -->
-    <!-- Removed 'muted' to try and hide the mute icon. -->
     <video id="pip-video" autoplay playsinline></video>
 
     <script>
-      const clockDisplay = document.getElementById("clock-display");
+      const clockDisplay = document.getElementById("_z418");
       const pipBtn = document.getElementById("pip-btn");
       const statusText = document.getElementById("status-text");
       const canvas = document.getElementById("pip-canvas");
       const ctx = canvas.getContext("2d");
       const video = document.getElementById("pip-video");
 
-      let timeOffset = 0; // Difference between server time and local time in ms
-      let isSyncing = true;
-      let syncInProgress = false;
       let canvasStreamTrack = null;
-      const AUTO_RESYNC_INTERVAL_MS = 60 * 1000;
-      const FORCE_RESYNC_DRIFT_MS = 1000;
-      const MAX_TRUSTED_OFFSET_MS = 2 * 60 * 1000;
-      const DISPLAY_LEAD_MS = 500;
+      let lastTimeIsValue = "";
 
-      // 1. Time Synchronization
-      // We perform a "burst" of requests and pick the one with the lowest latency (RTT)
-      // This is standard NTP practice to avoid network jitter causing time errors.
-      async function fetchJsonWithTimeout(url, timeoutMs = 5000) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      // Match the original KTimer clock styling while letting Time.is write into this element.
+      clockDisplay.id = "_z418";
+      clockDisplay.style.fontSize = "5rem";
+      clockDisplay.style.fontWeight = "700";
+      clockDisplay.style.fontVariantNumeric = "tabular-nums";
+      clockDisplay.style.letterSpacing = "-2px";
+      clockDisplay.style.marginBottom = "1rem";
+      clockDisplay.style.textShadow = "0 0 20px rgba(56, 189, 248, 0.3)";
+      clockDisplay.style.display = "block";
 
-        try {
-          const response = await fetch(url, {
-            cache: "no-store",
-            signal: controller.signal,
-          });
-          if (!response.ok)
-            throw new Error(`${url} returned ${response.status}`);
-          return await response.json();
-        } finally {
-          clearTimeout(timeoutId);
-        }
-      }
-
-      async function fetchTimeSample() {
-        const sources = [
-          {
-            name: "worldtimeapi.org",
-            url: "https://worldtimeapi.org/api/timezone/Etc/UTC",
-            getServerTime: (data) =>
-              new Date(data.utc_datetime || data.datetime).getTime(),
-          },
-        ];
-
-        let lastError = null;
-        for (const source of sources) {
-          const start = Date.now();
-          try {
-            const data = await fetchJsonWithTimeout(source.url);
-            const end = Date.now();
-            const latency = (end - start) / 2;
-            const serverTime = source.getServerTime(data);
-
-            if (!Number.isFinite(serverTime)) {
-              throw new Error(`${source.name} returned an invalid time`);
-            }
-
-            const offset = serverTime + latency - end; // offset relative to 'end' time
-            if (Math.abs(offset) > MAX_TRUSTED_OFFSET_MS) {
-              throw new Error(
-                `${source.name} offset rejected: ${Math.round(offset)}ms`,
-              );
-            }
-            return {
-              offset,
-              rtt: end - start,
-              source: source.name,
-              error: null,
-            };
-          } catch (e) {
-            lastError = e;
-            console.warn(`Time source failed: ${source.name}`, e);
-          }
-        }
-
-        return { error: lastError || new Error("All time sources failed") };
-      }
-
-      async function syncTime({ silent = false } = {}) {
-        if (syncInProgress) return;
-
-        syncInProgress = true;
-        if (!silent) statusText.textContent = "Precision syncing...";
-
-        // Take 3 samples
-        const samples = [];
-        for (let i = 0; i < 3; i++) {
-          if (!silent) statusText.textContent = `Syncing sample ${i + 1}/3...`;
-          const sample = await fetchTimeSample();
-          if (!sample.error) {
-            samples.push(sample);
-          }
-          // Small delay between samples
-          await new Promise((r) => setTimeout(r, 200));
-        }
-
-        if (samples.length === 0) {
-          console.error("All sync samples failed");
-          if (!silent) {
-            statusText.textContent = "Using device time.";
-            setTimeout(() => (statusText.textContent = ""), 3000);
-          }
-          isSyncing = false;
-          syncInProgress = false;
-          setTimeout(() => syncTime({ silent: true }), 10000); // Retry logic
-          return;
-        }
-
-        // Pick sample with lowest RTT (Round Trip Time) -> Most accurate
-        samples.sort((a, b) => a.rtt - b.rtt);
-        const bestSample = samples[0];
-
-        const drift = bestSample.offset - timeOffset;
-        const shouldShowStatus =
-          !silent || Math.abs(drift) >= FORCE_RESYNC_DRIFT_MS;
-
-        timeOffset = bestSample.offset;
-        isSyncing = false;
-        syncInProgress = false;
-
-        const rttMsg = `RTT: ${bestSample.rtt}ms`;
-        const driftMsg = `drift: ${Math.round(drift)}ms`;
-        const sourceMsg = `source: ${bestSample.source}`;
-        if (shouldShowStatus) {
-          statusText.textContent = `Re-synced! (${rttMsg}, ${driftMsg}, ${sourceMsg})`;
-          setTimeout(() => (statusText.textContent = ""), 3000);
-        }
-      }
-
-      // 2. Clock Logic
-      function formatTime(date) {
-        // Force 2 digits for hours, minutes, seconds
-        const pad = (n) => n.toString().padStart(2, "0");
-        const h = pad(date.getHours());
-        const m = pad(date.getMinutes());
-        const s = pad(date.getSeconds());
-        return `${h}:${m}:${s}`;
+      function normalizeTimeIsValue(value) {
+        const holder = document.createElement("div");
+        holder.innerHTML = String(value ?? "");
+        return holder.textContent.trim();
       }
 
       function drawToCanvas(text) {
-        // Clear background
-        ctx.fillStyle = "#0f172a"; // Match body bg
+        ctx.fillStyle = "#0f172a";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-        // Draw text
         ctx.fillStyle = "#f8fafc";
-        ctx.font = 'bold 450px "Inter", sans-serif'; // Optimized for 750px height
+        ctx.font = 'bold 450px "Inter", system-ui, sans-serif';
         ctx.textBaseline = "middle";
         ctx.textAlign = "center";
-        ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+        ctx.fillText(text || "--:--:--", canvas.width / 2, canvas.height / 2);
 
-        // Force a fresh frame for PiP, especially when the tab is backgrounded/throttled.
         canvasStreamTrack?.requestFrame?.();
       }
 
-      let updateTimeoutId;
-      function updateLoop() {
-        const now = getCorrectedDate();
-        const timeString = formatTime(now);
+      // Official Time.is advanced-widget callback.
+      // The value received here is the same rendered TIME string used by the widget.
+      window.ktimerTimeIsTick = function (renderedValue) {
+        const timeText = normalizeTimeIsValue(renderedValue);
+        if (!timeText) return;
 
-        // Update DOM
-        clockDisplay.textContent = timeString;
+        lastTimeIsValue = timeText;
+        drawToCanvas(timeText);
 
-        // Update Canvas (for PiP)
-        drawToCanvas(timeString);
+        if (statusText.textContent) {
+          statusText.textContent = "Nguồn thời gian: Time.is · Vĩnh Long";
+          setTimeout(() => {
+            if (statusText.textContent.startsWith("Nguồn thời gian:")) {
+              statusText.textContent = "";
+            }
+          }, 2500);
+        }
+      };
 
-        // Schedule the next render just after the next second boundary.
-        const delayUntilNextSecond = 1000 - now.getMilliseconds() + 20;
-        updateTimeoutId = setTimeout(updateLoop, delayUntilNextSecond);
-      }
-
-      function startUpdateLoop() {
-        clearTimeout(updateTimeoutId);
-        updateLoop(); // Initial call
-      }
-
-      // 3. PiP Logic
       async function startPip() {
         if (document.pictureInPictureElement) {
           await document.exitPictureInPicture();
@@ -339,94 +226,51 @@
         }
 
         try {
-          // Ensure the video is playing a stream from the canvas
+          if (!document.pictureInPictureEnabled || !video.requestPictureInPicture) {
+            throw new Error("Trình duyệt này không hỗ trợ Picture-in-Picture API cho video.");
+          }
+
+          drawToCanvas(lastTimeIsValue || clockDisplay.textContent.trim());
+
           if (!video.srcObject) {
-            const stream = canvas.captureStream(0); // Manual frames via requestFrame()
+            const stream = canvas.captureStream(0);
             canvasStreamTrack = stream.getVideoTracks()[0] || null;
             video.srcObject = stream;
           }
 
-          // Ensure valid volume state (unmuted) so icon doesn't show "muted"
           video.muted = false;
           video.volume = 1.0;
-
-          // Play logic for iOS/Android compatibility
           await video.play();
 
-          // Set Media Session metadata to look like a Clock app, not a video
           if ("mediaSession" in navigator) {
             navigator.mediaSession.metadata = new MediaMetadata({
               title: "Đồng hồ KTimer",
-              artist: "Hệ thống",
+              artist: "Time.is · Vĩnh Long",
               album: "Picture-in-Picture",
             });
             navigator.mediaSession.playbackState = "playing";
           }
 
-          // Request PiP
           await video.requestPictureInPicture();
         } catch (err) {
           console.error("PiP Error:", err);
-          statusText.textContent = `Error: ${err.message}`;
+          statusText.textContent = `Lỗi PiP: ${err.message}`;
         }
       }
 
-      // Initialize
-      pipBtn.innerHTML = `
-      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><path d="M7 7h10 M7 12h10 M7 17h10"/></svg>
-      Bật Đồng Hồ PiP`; // Updated Text and Icon (Layout)
       pipBtn.addEventListener("click", startPip);
+      drawToCanvas("--:--:--");
+    </script>
 
-      // Manual Offset Logic
-      let userOffset = 0;
-      const offsetControls = document.createElement("div");
-      offsetControls.style.marginTop = "2rem";
-      offsetControls.innerHTML = `
-        <div style="font-size: 0.9rem; color: #94a3b8; margin-bottom: 0.5rem;">Căn chỉnh thời gian (ms)</div>
-        <div style="display: flex; gap: 0.5rem; justify-content: center; align-items: center;">
-            <button class="btn-micro" onclick="adjustOffset(-1000)">-1s</button>
-            <button class="btn-micro" onclick="adjustOffset(-100)">-0.1s</button>
-            <span id="offset-display" style="min-width: 60px; font-variant-numeric: tabular-nums;">0ms</span>
-            <button class="btn-micro" onclick="adjustOffset(100)">+0.1s</button>
-            <button class="btn-micro" onclick="adjustOffset(1000)">+1s</button>
-        </div>
-      `;
-      document.body.appendChild(offsetControls);
-
-      // Add styles for micro buttons
-      const style = document.createElement("style");
-      style.textContent = `
-        .btn-micro {
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            color: #ccc;
-            padding: 0.5rem 0.8rem;
-            border-radius: 4px;
-            cursor: pointer;
-            font-family: inherit;
-        }
-        .btn-micro:hover { background: rgba(255, 255, 255, 0.1); }
-      `;
-      document.head.appendChild(style);
-
-      window.adjustOffset = (amount) => {
-        userOffset += amount;
-        document.getElementById("offset-display").textContent =
-          (userOffset > 0 ? "+" : "") + userOffset + "ms";
-      };
-
-      function getCorrectedDate() {
-        // Base time (Server Sync) + User Manual Offset
-        const now = Date.now() + timeOffset + userOffset + DISPLAY_LEAD_MS;
-        return new Date(now);
-      }
-
-      // Initial sync and start loop
-      syncTime();
-      startUpdateLoop();
-
-      // Auto re-sync every minute. If drift is >= 1s, the new offset is applied immediately.
-      setInterval(() => syncTime({ silent: true }), AUTO_RESYNC_INTERVAL_MS);
+    <!-- Explicit HTTPS is intentional so the widget also works when this HTML is opened locally. -->
+    <script src="https://widget.time.is/t.js"></script>
+    <script>
+      time_is_widget.init({
+        _z418: {
+          id: "Vĩnh_Long__Vinh_Long_z418",
+          callback: "ktimerTimeIsTick",
+        },
+      });
     </script>
   </body>
 </html>
